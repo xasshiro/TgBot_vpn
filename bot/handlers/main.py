@@ -2,9 +2,11 @@
 
 import logging
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from pathlib import Path
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import ContextTypes, ConversationHandler
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, selectinload
 
 from bot.models.database import DatabaseManager, User, Subscription, Payment
 from bot.config.settings import Config, SUBSCRIPTION_PLANS, PAYMENT_METHODS
@@ -38,12 +40,42 @@ SELECTING_PLAN, SELECTING_PAYMENT_METHOD, WAITING_PAYMENT = range(3)
 db_manager = DatabaseManager(Config.DATABASE_URL)
 db_manager.create_tables()
 
+BRAND_IMAGE_PATH = Path(__file__).resolve().parents[2] / "photo_2026-08-31 22.45.05.png"
+
+
+async def send_branded_message(update: Update, text: str, reply_markup=None, parse_mode='HTML') -> None:
+    """Send a branded image with caption and keyboard for every bot screen."""
+    if not BRAND_IMAGE_PATH.exists():
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+        else:
+            await update.message.reply_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+        return
+
+    with BRAND_IMAGE_PATH.open('rb') as photo_file:
+        if update.callback_query:
+            await update.callback_query.edit_message_media(
+                media=InputMediaPhoto(media=photo_file, caption=text, parse_mode=parse_mode),
+                reply_markup=reply_markup,
+            )
+        else:
+            await update.message.reply_photo(
+                photo=photo_file,
+                caption=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+            )
+
 
 def get_or_create_user(telegram_user) -> User:
     """Get or create user in database"""
     session = db_manager.get_session()
     try:
-        user = session.query(User).filter_by(telegram_id=telegram_user.id).first()
+        user = session.query(User).options(
+            selectinload(User.subscriptions),
+            selectinload(User.payments),
+            selectinload(User.referrals)
+        ).filter_by(telegram_id=telegram_user.id).first()
         
         if not user:
             user = User(
@@ -63,6 +95,13 @@ def get_or_create_user(telegram_user) -> User:
         # Update user activity
         user.last_activity = datetime.utcnow()
         session.commit()
+
+        # Reload eagerly to keep relationship data available after session close
+        user = session.query(User).options(
+            selectinload(User.subscriptions),
+            selectinload(User.payments),
+            selectinload(User.referrals)
+        ).filter_by(id=user.id).first()
         
         return user
     finally:
@@ -120,8 +159,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     else:
         message_text = get_message('welcome')
     
-    await update.message.reply_text(
-        message_text,
+    await send_branded_message(
+        update=update,
+        text=message_text,
         reply_markup=reply_markup,
         parse_mode='HTML'
     )
@@ -179,7 +219,8 @@ async def show_plans(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await query.edit_message_text(
+    await send_branded_message(
+        update=update,
         text=message_text,
         reply_markup=reply_markup,
         parse_mode='HTML'
@@ -198,7 +239,7 @@ async def select_payment_method(update: Update, context: ContextTypes.DEFAULT_TY
     
     plan = SUBSCRIPTION_PLANS.get(plan_type)
     if not plan:
-        await query.edit_message_text("❌ Неверный план")
+        await send_branded_message(update=update, text="❌ Неверный план", parse_mode='HTML')
         return ConversationHandler.END
     
     # Get available payment methods
@@ -216,7 +257,8 @@ async def select_payment_method(update: Update, context: ContextTypes.DEFAULT_TY
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await query.edit_message_text(
+    await send_branded_message(
+        update=update,
         text=get_message('payment_methods',
             plan_name=plan['name'],
             amount=plan['price'],
@@ -238,7 +280,7 @@ async def process_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     plan_type = context.user_data.get('selected_plan')
     
     if not plan_type:
-        await query.edit_message_text("❌ Ошибка: план не выбран")
+        await send_branded_message(update=update, text="❌ Ошибка: план не выбран", parse_mode='HTML')
         return ConversationHandler.END
     
     plan = SUBSCRIPTION_PLANS[plan_type]
@@ -274,7 +316,7 @@ async def process_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             
         except PaymentError as e:
             logger.error(f"Payment creation error: {e}")
-            await query.edit_message_text(f"❌ {str(e)}")
+            await send_branded_message(update=update, text=f"❌ {str(e)}", parse_mode='HTML')
             return ConversationHandler.END
         
         # Store payment info for verification
@@ -287,22 +329,22 @@ async def process_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await query.edit_message_text(
+        await send_branded_message(
+            update=update,
             text=get_message('payment_created',
                 plan_name=plan['name'],
                 amount=plan['price'],
                 payment_url=payment_data['payment_url']
             ),
             reply_markup=reply_markup,
-            parse_mode='HTML',
-            disable_web_page_preview=True
+            parse_mode='HTML'
         )
         
         return WAITING_PAYMENT
         
     except Exception as e:
         logger.error(f"Payment creation error: {e}")
-        await query.edit_message_text(get_message('error_general'))
+        await send_branded_message(update=update, text=get_message('error_general'), parse_mode='HTML')
         return ConversationHandler.END
     finally:
         session.close()
@@ -319,12 +361,12 @@ async def verify_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         payment = session.query(Payment).filter_by(id=payment_id).first()
         if not payment:
-            await query.edit_message_text("❌ Платеж не найден")
+            await send_branded_message(update=update, text="❌ Платеж не найден", parse_mode='HTML')
             return ConversationHandler.END
         
         # Check if payment expired
         if payment.is_expired:
-            await query.edit_message_text(get_message('error_payment_timeout'))
+            await send_branded_message(update=update, text=get_message('error_payment_timeout'), parse_mode='HTML')
             return ConversationHandler.END
         
         # Verify payment with provider
@@ -389,7 +431,7 @@ async def verify_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 server_location=f"{get_server_flag(server_location)} {server_location}"
             )
             
-            await query.edit_message_text(success_message, parse_mode='HTML')
+            await send_branded_message(update=update, text=success_message, parse_mode='HTML')
             
             # Send VPN config as file
             config_filename = generate_config_filename(user.telegram_id, payment.plan_type)
@@ -418,7 +460,7 @@ async def verify_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         elif payment_status == 'failed':
             payment.status = 'failed'
             session.commit()
-            await query.edit_message_text(get_message('payment_failed'), parse_mode='HTML')
+            await send_branded_message(update=update, text=get_message('payment_failed'), parse_mode='HTML')
             
         else:  # pending or unknown
             time_left = int((payment.expires_at - datetime.utcnow()).total_seconds() / 60)
@@ -429,7 +471,8 @@ async def verify_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 
-                await query.edit_message_text(
+                await send_branded_message(
+                    update=update,
                     text=get_message('payment_pending',
                         amount=payment.amount_rubles,
                         payment_url=payment.payment_url,
@@ -439,13 +482,13 @@ async def verify_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     parse_mode='HTML'
                 )
             else:
-                await query.edit_message_text(get_message('error_payment_timeout'))
+                await send_branded_message(update=update, text=get_message('error_payment_timeout'), parse_mode='HTML')
         
         return ConversationHandler.END
         
     except Exception as e:
         logger.error(f"Payment verification error: {e}")
-        await query.edit_message_text(get_message('error_general'))
+        await send_branded_message(update=update, text=get_message('error_general'), parse_mode='HTML')
         return ConversationHandler.END
     finally:
         session.close()
@@ -482,7 +525,8 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await query.edit_message_text(
+    await send_branded_message(
+        update=update,
         text=get_message('profile_info',
             user_id=user.telegram_id,
             full_name=user.full_name,
@@ -504,16 +548,13 @@ async def show_my_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user = get_or_create_user(update.effective_user)
     
     if not user.has_active_subscription:
-        await query.edit_message_text(get_message('error_no_subscription'))
+        await send_branded_message(update=update, text=get_message('error_no_subscription'), parse_mode='HTML')
         return
     
     subscription = user.active_subscription
     
     # Send config info
-    await query.edit_message_text(
-        text=get_message('vpn_config_info'),
-        parse_mode='HTML'
-    )
+    await send_branded_message(update=update, text=get_message('vpn_config_info'), parse_mode='HTML')
     
     # Send config file
     config_filename = generate_config_filename(user.telegram_id, subscription.plan_type)
@@ -559,7 +600,8 @@ async def show_referral_info(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await query.edit_message_text(
+    await send_branded_message(
+        update=update,
         text=get_message('referral_info',
             referral_count=user.total_referrals,
             earned_amount=user.referral_balance,
@@ -584,7 +626,8 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await query.edit_message_text(
+    await send_branded_message(
+        update=update,
         text=get_message('help'),
         reply_markup=reply_markup,
         parse_mode='HTML'
@@ -603,7 +646,8 @@ async def show_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await query.edit_message_text(
+    await send_branded_message(
+        update=update,
         text=get_message('support_info', support_username=Config.SUPPORT_USERNAME),
         reply_markup=reply_markup,
         parse_mode='HTML'
@@ -637,13 +681,15 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     message_text = get_message('welcome_back', name=user.first_name or 'друг')
     
     if query:
-        await query.edit_message_text(
+        await send_branded_message(
+            update=update,
             text=message_text,
             reply_markup=reply_markup,
             parse_mode='HTML'
         )
     else:
-        await update.message.reply_text(
+        await send_branded_message(
+            update=update,
             text=message_text,
             reply_markup=reply_markup,
             parse_mode='HTML'
@@ -654,5 +700,5 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancel current conversation"""
-    await update.message.reply_text("❌ Операция отменена")
+    await send_branded_message(update=update, text="❌ Операция отменена", parse_mode='HTML')
     return ConversationHandler.END

@@ -215,7 +215,12 @@ class DatabaseManager:
     
     def __init__(self, database_url: str):
         self.engine = create_engine(database_url)
-        self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
+        self.SessionLocal = sessionmaker(
+            autocommit=False,
+            autoflush=False,
+            bind=self.engine,
+            expire_on_commit=False,
+        )
         
     def create_tables(self):
         """Create all database tables"""
